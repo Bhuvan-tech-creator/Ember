@@ -1,11 +1,17 @@
 import io
 import json
 import os
+import time
 
 from PIL import Image, ImageDraw
-import streamlit as st
 
-MODEL_ID = "gemini-2.5-flash"
+MODEL_CHAIN = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
+]
 MAX_IMAGES_PER_CALL = 6
 
 PROMPT = """You are a certified wildfire home-hardening inspector in California performing a
@@ -30,7 +36,7 @@ Reply with STRICT JSON, no markdown, no code fences:
   "open_vents": "yes|no|unclear",
   "screened_vents": "yes|no|unclear",
   "wood_fence_touching_house": "yes|no|unclear",
-  "vegetation_or_mulch_touching_wall": "yes|no|unclear",
+  "vegetation_or_mulch_within_5ft_of_wall": "yes|no|unclear",
   "open_rafter_eaves_visible": "yes|no|unclear",
   "soffited_eaves_visible": "yes|no|unclear",
   "gutters_with_debris_visible": "yes|no|unclear",
@@ -51,40 +57,48 @@ conditions that are not visibly present."""
 
 def _get_client():
     from google import genai
-    key = None
-    try:
-        key = st.secrets.get("GEMINI_API_KEY")
-    except Exception:
-        pass
-    key = key or os.environ.get("GEMINI_API_KEY")
+    key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY not found")
     return genai.Client(api_key=key)
 
-def inspect_frames(frames, log=None):
-    client = _get_client()
+def inspect_frames(frames, log=None, on_try=None):
+    """One attempt per engine, fail-fast. on_try(index, model_name) feeds the
+    live progress bar so the user sees real activity."""
     from google.genai import types
+    client = _get_client()
     frames = frames[:MAX_IMAGES_PER_CALL]
     contents = [PROMPT] + [f.copy() for f in frames]
-    if log:
-        log.write(f"   …{len(frames)} frames, 14-point inspection, one request")
 
-    resp = client.models.generate_content(
-        model=MODEL_ID,
-        contents=contents,
-        config=types.GenerateContentConfig(temperature=0.1,
-                                           response_mime_type="application/json"),
-    )
-    data = json.loads(resp.text)
+    data, used_model, tried = None, None, []
+    for i, model_id in enumerate(MODEL_CHAIN):
+        tried.append(model_id)
+        if on_try:
+            on_try(i, model_id)
+        try:
+            resp = client.models.generate_content(
+                model=model_id, contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=0.1, response_mime_type="application/json"))
+            data = json.loads(resp.text); used_model = model_id; break
+        except Exception as e:
+            print(f"engine {model_id} failed fast: {str(e)[:120]}")
+            time.sleep(0.4)
+
+    if data is None:
+        raise RuntimeError(
+            "All free Gemini vision engines are momentarily overloaded "
+            f"(tried: {', '.join(tried)}). Wait 5-30 minutes and analyze again.")
+
     votes = {k: [v] for k, v in data.items()
              if k not in ("evidence_sentence", "highlights")}
-    evidence = [data["evidence_sentence"]] if data.get("evidence_sentence") else []
+    evidence = ([data["evidence_sentence"]] if data.get("evidence_sentence") else [])
+    evidence.append(f"Vision engine: {used_model}")
     highlights = data.get("highlights") or []
     return votes, evidence, highlights if isinstance(highlights, list) else []
 
 def votes_to_presence(votes):
-    def yes(key):
-        return "yes" in votes.get(key, [])
+    def yes(k): return "yes" in votes.get(k, [])
     return {
         "wood_roof": yes("wood_shake_roof"),
         "tile_roof": yes("tile_or_composite_roof"),
@@ -108,13 +122,12 @@ def draw_highlights(frames, highlights):
         idx = hl.get("frame_index", 0)
         if not (0 <= idx < len(frames)):
             continue
-        img = frames[idx].copy()
-        w, h = img.size
+        img = frames[idx].copy(); w, h = img.size
         try:
             x1, y1, x2, y2 = [float(v) for v in hl["box"]]
         except Exception:
             continue
-        px = (int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h))
+        px = (int(x1*w), int(y1*h), int(x2*w), int(y2*h))
         d = ImageDraw.Draw(img)
         for i in range(4):
             d.rectangle([px[0]-i, px[1]-i, px[2]+i, px[3]+i], outline=(193, 82, 47))
